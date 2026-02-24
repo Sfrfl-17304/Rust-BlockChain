@@ -11,6 +11,51 @@ struct Block {
     nonce: u32,
 }
 
+//Blockchain struct
+struct Blockchain {
+    blocks: Vec<Block>,
+    difficulty: usize,
+}
+
+
+// Implementing the Blockchain struct and its associated functions
+impl Blockchain {
+    fn new(difficulty: usize) -> Self {
+        let mut blockchain = Blockchain {
+            blocks: Vec::new(),
+            difficulty,
+        };
+        let genesis_block = Block::new(0, SystemTime::now().duration_since(UNIX_EPOCH).expect("Time went backwards").as_secs(), vec!["Genesis Block".to_string()], "0".to_string());
+        blockchain.blocks.push(genesis_block);
+        blockchain
+    }
+
+    fn add_block(&mut self, transactions: Vec<String>) {
+        let previous_hash = self.blocks.last().unwrap().hash.clone();
+        let index = self.blocks.len() as u32;
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).expect("Time went backwards").as_secs();
+        let mut new_block = Block::new(index, timestamp, transactions, previous_hash);
+        new_block.mine_block(self.difficulty);
+        self.blocks.push(new_block);
+
+    fn is_chain_valid(&self) -> bool {
+        for i in 1..self.blocks.len() {
+            let current_block = &self.blocks[i];
+            let previous_block = &self.blocks[i - 1];
+
+            if current_block.hash != current_block.calculate_hash() {
+                return false;
+            }
+
+            if current_block.previous_hash != previous_block.hash {
+                return false;
+            }
+        }
+        true
+    }
+    }
+
+
 // Implementing the Block struct and its associated functions
 impl Block {
     fn calculate_hash(&self) -> String {
@@ -49,54 +94,24 @@ impl Block {
 //Main function to demonstrate the blockchain prototype
 
 fn main() {
-    let mut blockchain: Vec<Block> = Vec::new();
+    let difficulty = 4; // Adjust as needed
+    let mut blockchain = Blockchain::new(difficulty);
 
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
-        .as_secs();
+    // Add a new block with a transaction
+    let transactions = vec!["Alice pays Bob 10 coins".to_string()];
+    blockchain.add_block(transactions);
 
-    let mut genesis_block = Block::new(0, timestamp, "Genesis Block".to_string(), "0".to_string());
+    // Validate the chain
+    println!("Blockchain valid? {}", blockchain.is_chain_valid());
 
-    let mut difficulty = 5;
-
-    genesis_block.mine_block(difficulty);
-    blockchain.push(genesis_block);
-
-    let mut new_block: Block = Block::new(
-        1,
-        timestamp,
-        "Transaction: Alice pays Bob 10 coins".to_string(),
-        blockchain.last().unwrap().hash.clone(),
-    );
-
-    println!("block before mining");
-    println!("Index: {}", new_block.index);
-    println!("Timestamp: {}", new_block.timestamp);
-    println!("Transaction: {}", new_block.transaction);
-    println!("Previous Hash: {}", new_block.previous_hash);
-    println!("Hash: {}", new_block.hash);
-    println!("Nonce: {}", new_block.nonce);
-
-    new_block.mine_block(5);
-
-    println!("block after mining!");
-    println!("Index: {}", new_block.index);
-    println!("Timestamp: {}", new_block.timestamp);
-    println!("Transaction: {}", new_block.transaction);
-    println!("Previous Hash: {}", new_block.previous_hash);
-    println!("Hash: {}", new_block.hash);
-    println!("Nonce: {}", new_block.nonce);
-
-    blockchain.push(new_block);
-
-    println!("Blockchain:");
-    for block in &blockchain {
-        println!("Index: {}", block.index);
+    // Print all blocks
+    for block in &blockchain.blocks {
+        println!("Block #{}", block.index);
         println!("Timestamp: {}", block.timestamp);
-        println!("Transaction: {}", block.transaction);
+        println!("Transactions: {:?}", block.transactions);
         println!("Previous Hash: {}", block.previous_hash);
         println!("Hash: {}", block.hash);
         println!("Nonce: {}", block.nonce);
+        println!();
     }
 }
