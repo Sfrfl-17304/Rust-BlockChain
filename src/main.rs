@@ -1,189 +1,176 @@
-// Simple educational blockchain with:
-// - UTXO transactions
-// - Proof-of-Work mining
-// - Basic networking between nodes
-// - Minimal CLI
-// - FIXED: Proper fork handling and block validation
-// Every section is commented so you can follow step-by-step.
+use k256::ecdsa::{
+    Signature, SigningKey, VerifyingKey,
+    signature::{Signer, Verifier},
+};
+use rand_core::OsRng;
+use ripemd::Ripemd160;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::{self, BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use sha2::{Digest, Sha256}; // SHA-256 hashing for tx/block ids
-use std::collections::{HashMap, HashSet}; // UTXO map + double-spend tracking
-use std::io::{self, BufRead, BufReader, Write}; // CLI + network I/O
-use std::net::{TcpListener, TcpStream}; // TCP networking
-use std::sync::{Arc, Mutex}; // Shared state across threads
-use std::thread; // Spawn threads
-use std::time::{SystemTime, UNIX_EPOCH}; // Timestamps
+const BLOCK_REWARD: u64 = 50;
+const CHAIN_PATH: &str = "data/chain.json";
 
-const BLOCK_REWARD: u64 = 50; // Fixed block reward (coinbase)
-
-// -------------------------
-// Transactions (UTXO model)
-// -------------------------
-
-// Transaction input = references a previous unspent output.
 #[derive(Clone, Debug)]
+struct Wallet {
+    signing_key: SigningKey,
+    pubkey_hex: String,
+    pubkey_hash_hex: String,
+}
+
+impl Wallet {
+    fn new() -> Self {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let verifying_key = *signing_key.verifying_key();
+        let pubkey_bytes = verifying_key.to_encoded_point(true).as_bytes().to_vec();
+        let pubkey_hex = hex::encode(&pubkey_bytes);
+        let pubkey_hash_hex = hash160_hex(&pubkey_bytes);
+        Self {
+            signing_key,
+            pubkey_hex,
+            pubkey_hash_hex,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct TxIn {
-    txid: String, // transaction hash we are spending
-    vout: usize,  // output index inside that transaction
+    txid: String,
+    vout: usize,
+    signature: String, // DER-encoded signature in hex
+    pubkey: String,    // compressed pubkey hex
 }
 
-// Transaction output = new coin ownership.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct TxOut {
-    address: String, // who owns it
-    amount: u64,     // how many coins
+    pubkey_hash: String, // HASH160(pubkey) hex
+    amount: u64,
 }
 
-// Transaction = inputs + outputs + timestamp.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Transaction {
     inputs: Vec<TxIn>,
     outputs: Vec<TxOut>,
     timestamp: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct NodeState {
+    chain: String,
+    height: usize,
+    tip: String,
+    mempool: Vec<Transaction>,
+    utxo_count: usize,
+    difficulty: u32,
+}
+
 impl Transaction {
-    // Create normal transaction.
     fn new(inputs: Vec<TxIn>, outputs: Vec<TxOut>) -> Self {
-        Transaction {
+        Self {
             inputs,
             outputs,
             timestamp: now_ts(),
         }
     }
 
-    // Create coinbase transaction (no inputs).
-    fn coinbase(to: &str, amount: u64) -> Self {
-        Transaction {
+    fn coinbase(to_pubkey_hash: &str, amount: u64) -> Self {
+        Self {
             inputs: Vec::new(),
             outputs: vec![TxOut {
-                address: to.to_string(),
+                pubkey_hash: to_pubkey_hash.to_string(),
                 amount,
             }],
             timestamp: now_ts(),
         }
     }
 
-    // Serialize into a simple string (easy but not robust).
     fn serialize(&self) -> String {
-        let inputs = if self.inputs.is_empty() {
-            "-".to_string()
-        } else {
-            self.inputs
-                .iter()
-                .map(|i| format!("{}:{}", i.txid, i.vout))
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-        let outputs = if self.outputs.is_empty() {
-            "-".to_string()
-        } else {
-            self.outputs
-                .iter()
-                .map(|o| format!("{}:{}", o.address, o.amount))
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-        format!("{}|{}|{}", inputs, outputs, self.timestamp)
+        serde_json::to_string(self).unwrap_or_default()
     }
 
-    // Deserialize from the string format above.
     fn deserialize(s: &str) -> Option<Self> {
-        let parts: Vec<&str> = s.split('|').collect();
-        if parts.len() != 3 {
-            return None;
-        }
-
-        let inputs = if parts[0] == "-" {
-            Vec::new()
-        } else {
-            parts[0]
-                .split(',')
-                .filter_map(|p| {
-                    let kv: Vec<&str> = p.split(':').collect();
-                    if kv.len() != 2 {
-                        return None;
-                    }
-                    Some(TxIn {
-                        txid: kv[0].to_string(),
-                        vout: kv[1].parse().ok()?,
-                    })
-                })
-                .collect()
-        };
-
-        let outputs = if parts[1] == "-" {
-            Vec::new()
-        } else {
-            parts[1]
-                .split(',')
-                .filter_map(|p| {
-                    let kv: Vec<&str> = p.split(':').collect();
-                    if kv.len() != 2 {
-                        return None;
-                    }
-                    Some(TxOut {
-                        address: kv[0].to_string(),
-                        amount: kv[1].parse().ok()?,
-                    })
-                })
-                .collect()
-        };
-
-        let timestamp = parts[2].parse().ok()?;
-        Some(Transaction {
-            inputs,
-            outputs,
-            timestamp,
-        })
+        serde_json::from_str(s).ok()
     }
 
-    // Transaction id = SHA-256 of serialized data.
     fn txid(&self) -> String {
         hash_str(&self.serialize())
     }
+
+    // Canonical message for signing one input.
+    // Clears all input sig/pubkeys and commits to prevout being spent.
+    fn sighash_for_input(&self, input_index: usize, prev_pubkey_hash: &str) -> String {
+        let mut tx = self.clone();
+        for i in 0..tx.inputs.len() {
+            tx.inputs[i].signature.clear();
+            tx.inputs[i].pubkey.clear();
+        }
+        let base = serde_json::json!({
+            "tx": tx,
+            "input_index": input_index,
+            "prev_pubkey_hash": prev_pubkey_hash,
+        });
+        hash_str(&base.to_string())
+    }
+
+    fn sign_input(&mut self, input_index: usize, wallet: &Wallet, prev_pubkey_hash: &str) -> bool {
+        if input_index >= self.inputs.len() {
+            return false;
+        }
+        let digest_hex = self.sighash_for_input(input_index, prev_pubkey_hash);
+        let sig: Signature = wallet.signing_key.sign(digest_hex.as_bytes());
+        self.inputs[input_index].signature = hex::encode(sig.to_der().as_bytes());
+        self.inputs[input_index].pubkey = wallet.pubkey_hex.clone();
+        true
+    }
 }
 
-// ----- Blocks -----
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Block {
-    index: u32,                     // block height
-    timestamp: u64,                 // creation time
-    transactions: Vec<Transaction>, // list of transactions
-    previous_hash: String,          // hash of previous block
-    hash: String,                   // hash of this block
-    nonce: u64,                     // PoW nonce
+    index: u32,
+    timestamp: u64,
+    transactions: Vec<Transaction>,
+    previous_hash: String,
+    merkle_root: String,
+    difficulty: u32, // leading zero bits target style (simple)
+    hash: String,
+    nonce: u64,
 }
 
 impl Block {
-    // Build the hash input string and hash it.
     fn calculate_hash(&self) -> String {
-        let tx_data = self
-            .transactions
-            .iter()
-            .map(|t| t.serialize())
-            .collect::<Vec<_>>()
-            .join("~~"); // simple separator
-        let input = format!(
-            "{};{};{};{};{}",
-            self.index, self.timestamp, tx_data, self.previous_hash, self.nonce
-        );
-        hash_str(&input)
+        let header = serde_json::json!({
+            "index": self.index,
+            "timestamp": self.timestamp,
+            "previous_hash": self.previous_hash,
+            "merkle_root": self.merkle_root,
+            "difficulty": self.difficulty,
+            "nonce": self.nonce
+        });
+        hash_str(&header.to_string())
     }
 
-    // Create a new block (not yet mined).
     fn new(
         index: u32,
         timestamp: u64,
         transactions: Vec<Transaction>,
         previous_hash: String,
+        difficulty: u32,
     ) -> Self {
-        let mut block = Block {
+        let merkle_root = merkle_root_hex(&transactions);
+        let mut block = Self {
             index,
             timestamp,
             transactions,
             previous_hash,
+            merkle_root,
+            difficulty,
             hash: String::new(),
             nonce: 0,
         };
@@ -191,309 +178,289 @@ impl Block {
         block
     }
 
-    // Proof-of-Work: find nonce so hash starts with N zeros.
-    fn mine_block(&mut self, difficulty: usize) {
-        let target = "0".repeat(difficulty);
+    fn mine_block(&mut self) {
         loop {
             self.hash = self.calculate_hash();
-            if self.hash.starts_with(&target) {
+            if has_leading_zero_bits_hex(&self.hash, self.difficulty) {
                 break;
             }
-            self.nonce += 1;
+            self.nonce = self.nonce.wrapping_add(1);
         }
     }
 
-    // Serialize block to a string.
     fn serialize(&self) -> String {
-        let txs = if self.transactions.is_empty() {
-            "-".to_string()
-        } else {
-            self.transactions
-                .iter()
-                .map(|t| t.serialize())
-                .collect::<Vec<_>>()
-                .join("~~")
-        };
-        format!(
-            "{};{};{};{};{}",
-            self.index, self.timestamp, self.previous_hash, self.nonce, txs
-        )
+        serde_json::to_string(self).unwrap_or_default()
     }
 
-    // Deserialize a block from string.
     fn deserialize(s: &str) -> Option<Self> {
-        let parts: Vec<&str> = s.split(';').collect();
-        if parts.len() != 5 {
-            return None;
-        }
-        let index = parts[0].parse().ok()?;
-        let timestamp = parts[1].parse().ok()?;
-        let previous_hash = parts[2].to_string();
-        let nonce = parts[3].parse().ok()?;
-        let transactions = if parts[4] == "-" {
-            Vec::new()
-        } else {
-            parts[4]
-                .split("~~")
-                .filter_map(Transaction::deserialize)
-                .collect()
-        };
-
-        let mut block = Block {
-            index,
-            timestamp,
-            transactions,
-            previous_hash,
-            hash: String::new(),
-            nonce,
-        };
-        block.hash = block.calculate_hash();
-        Some(block)
+        serde_json::from_str(s).ok()
     }
 }
 
-// ----------------
-// Blockchain state
-// ----------------
-
 struct Blockchain {
-    blocks: Vec<Block>,                     // chain of blocks
-    difficulty: usize,                      // PoW difficulty
-    utxos: HashMap<(String, usize), TxOut>, // UTXO set
-    miner_address: String,                  // where coinbase goes
+    blocks: Vec<Block>,
+    difficulty: u32,
+    utxos: HashMap<(String, usize), TxOut>,
+    miner_pubkey_hash: String,
 }
 
 impl Blockchain {
-    // Create chain with a mined genesis block.
-    fn new(difficulty: usize, miner_address: &str) -> Self {
-        // Deterministic genesis so all nodes start from the same chain.
-        let coinbase = Transaction {
-            inputs: Vec::new(),
+    fn new(difficulty: u32, miner_pubkey_hash: &str) -> Self {
+        let genesis_tx = Transaction {
+            inputs: vec![],
             outputs: vec![TxOut {
-                address: "genesis".to_string(),
+                pubkey_hash: "genesis".to_string(),
                 amount: 0,
             }],
             timestamp: 0,
         };
-        let genesis = Block::new(0, 0, vec![coinbase], "0".to_string());
+        let mut genesis = Block::new(0, 0, vec![genesis_tx], "0".to_string(), difficulty);
+        genesis.mine_block();
 
-        let mut chain = Blockchain {
+        let mut chain = Self {
             blocks: vec![genesis],
             difficulty,
             utxos: HashMap::new(),
-            miner_address: miner_address.to_string(),
+            miner_pubkey_hash: miner_pubkey_hash.to_string(),
         };
         chain.rebuild_utxos();
         chain
     }
 
-    // Mine a block locally and add it (returns the block).
-    fn mine_block_with_txs(&mut self, mut transactions: Vec<Transaction>) -> Option<Block> {
-        // Always insert coinbase first.
-        let coinbase = Transaction::coinbase(&self.miner_address, BLOCK_REWARD);
-        transactions.insert(0, coinbase);
+    fn mine_block_with_txs(&mut self, mut txs: Vec<Transaction>) -> Option<Block> {
+        let coinbase = Transaction::coinbase(&self.miner_pubkey_hash, BLOCK_REWARD);
+        txs.insert(0, coinbase);
 
-        let previous_hash = self.blocks.last().unwrap().hash.clone();
+        let prev_hash = self.blocks.last().unwrap().hash.clone();
         let index = self.blocks.len() as u32;
-        let timestamp = now_ts();
+        let mut block = Block::new(index, now_ts(), txs, prev_hash, self.difficulty);
+        block.mine_block();
 
-        let mut new_block = Block::new(index, timestamp, transactions, previous_hash);
-        new_block.mine_block(self.difficulty);
-
-        // FIX: Use validate_and_add_block instead of separate validate/apply
-        if self.try_add_block(new_block.clone()) {
-            Some(new_block)
+        if self.try_add_block(block.clone()) {
+            Some(block)
         } else {
             None
         }
     }
 
-    // FIX: New unified method for adding blocks (handles forks correctly)
     fn try_add_block(&mut self, block: Block) -> bool {
-        // Case 1: Block extends our chain
-        if block.index as usize == self.blocks.len()
-            && block.previous_hash == self.blocks.last().unwrap().hash
-        {
-            if self.validate_block_structure(&block) {
-                self.apply_block(&block);
-                self.blocks.push(block);
-                return true;
-            }
+        if block.index as usize != self.blocks.len() {
             return false;
         }
-
-        // Case 2: Block is from a competing fork - reject it
-        // (A full node would handle reorgs, but we keep it simple)
-        false
+        if block.previous_hash != self.blocks.last().unwrap().hash {
+            return false;
+        }
+        if !self.validate_block_structure(&block) {
+            return false;
+        }
+        self.apply_block(&block);
+        self.blocks.push(block);
+        true
     }
 
-    // Add a block received from the network.
     fn add_block(&mut self, block: Block) -> bool {
         self.try_add_block(block)
     }
 
-    // FIX: Renamed and simplified - validates structure, PoW, and transactions
     fn validate_block_structure(&self, block: &Block) -> bool {
-        // Hash must be correct
         if block.hash != block.calculate_hash() {
-            println!("  -> hash mismatch");
+            return false;
+        }
+        if !has_leading_zero_bits_hex(&block.hash, block.difficulty) {
+            return false;
+        }
+        if block.difficulty != self.difficulty {
+            return false;
+        }
+        let recomputed_merkle = merkle_root_hex(&block.transactions);
+        if recomputed_merkle != block.merkle_root {
             return false;
         }
 
-        // PoW must satisfy difficulty (skip genesis)
-        if block.index > 0 && !block.hash.starts_with(&"0".repeat(self.difficulty)) {
-            println!("  -> PoW insufficient");
-            return false;
-        }
-
-        // Validate transactions against a temporary UTXO set
-        let mut temp_utxos = self.utxos.clone();
-        if !Self::validate_and_apply_transactions(&block.transactions, &mut temp_utxos) {
-            println!("  -> transaction validation failed");
-            return false;
-        }
-
-        true
+        let mut temp = self.utxos.clone();
+        Self::validate_and_apply_transactions(&block.transactions, &mut temp)
     }
 
-    // Validate and apply txs to a UTXO set.
     fn validate_and_apply_transactions(
-        transactions: &[Transaction],
+        txs: &[Transaction],
         utxos: &mut HashMap<(String, usize), TxOut>,
     ) -> bool {
-        if transactions.is_empty() {
+        if txs.is_empty() {
             return false;
         }
 
-        // First tx must be coinbase (no inputs).
-        if !transactions[0].inputs.is_empty() {
+        // coinbase rules
+        if !txs[0].inputs.is_empty() {
             return false;
         }
-        // All other txs must have inputs.
-        for tx in transactions.iter().skip(1) {
-            if tx.inputs.is_empty() {
-                return false;
-            }
-        }
+        let coinbase_out_sum: u64 = txs[0].outputs.iter().map(|o| o.amount).sum();
 
-        // Track double-spends within this block.
         let mut spent_in_block: HashSet<(String, usize)> = HashSet::new();
+        let mut total_fees = 0u64;
 
-        for (i, tx) in transactions.iter().enumerate() {
+        for (i, tx) in txs.iter().enumerate() {
             if i == 0 {
-                // Coinbase: just add outputs.
-                for (vout, out) in tx.outputs.iter().enumerate() {
-                    utxos.insert((tx.txid(), vout), out.clone());
-                }
                 continue;
+            }
+            if tx.inputs.is_empty() || tx.outputs.is_empty() {
+                return false;
             }
 
             let mut sum_in = 0u64;
             let mut sum_out = 0u64;
 
-            // Check all inputs exist and not double-spent.
-            for input in &tx.inputs {
+            for (input_idx, input) in tx.inputs.iter().enumerate() {
                 let key = (input.txid.clone(), input.vout);
+
                 if spent_in_block.contains(&key) {
                     return false;
                 }
+
                 let prev = match utxos.get(&key) {
-                    Some(o) => o,
+                    Some(v) => v,
                     None => return false,
                 };
-                sum_in += prev.amount;
+
+                // P2PKH checks
+                let pubkey_bytes = match hex::decode(&input.pubkey) {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                let computed_pkh = hash160_hex(&pubkey_bytes);
+                if computed_pkh != prev.pubkey_hash {
+                    return false;
+                }
+
+                let digest_hex = tx.sighash_for_input(input_idx, &prev.pubkey_hash);
+
+                let vk = match VerifyingKey::from_sec1_bytes(&pubkey_bytes) {
+                    Ok(k) => k,
+                    Err(_) => return false,
+                };
+                let sig_bytes = match hex::decode(&input.signature) {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                let sig = match Signature::from_der(&sig_bytes) {
+                    Ok(s) => s,
+                    Err(_) => return false,
+                };
+
+                if vk.verify(digest_hex.as_bytes(), &sig).is_err() {
+                    return false;
+                }
+
+                sum_in = match sum_in.checked_add(prev.amount) {
+                    Some(v) => v,
+                    None => return false,
+                };
                 spent_in_block.insert(key);
             }
 
-            // Sum outputs.
             for out in &tx.outputs {
-                sum_out += out.amount;
+                if out.amount == 0 {
+                    return false;
+                }
+                sum_out = match sum_out.checked_add(out.amount) {
+                    Some(v) => v,
+                    None => return false,
+                };
             }
 
-            // Must not create money.
             if sum_in < sum_out {
                 return false;
             }
 
-            // Apply: remove inputs, add outputs.
-            for input in &tx.inputs {
-                utxos.remove(&(input.txid.clone(), input.vout));
+            total_fees = match total_fees.checked_add(sum_in - sum_out) {
+                Some(v) => v,
+                None => return false,
+            };
+        }
+
+        if coinbase_out_sum > BLOCK_REWARD + total_fees {
+            return false;
+        }
+
+        // Apply txs
+        for (i, tx) in txs.iter().enumerate() {
+            if i != 0 {
+                for input in &tx.inputs {
+                    utxos.remove(&(input.txid.clone(), input.vout));
+                }
             }
+            let txid = tx.txid();
             for (vout, out) in tx.outputs.iter().enumerate() {
-                utxos.insert((tx.txid(), vout), out.clone());
+                utxos.insert((txid.clone(), vout), out.clone());
             }
         }
 
         true
     }
 
-    // Apply a block to the real UTXO set.
     fn apply_block(&mut self, block: &Block) {
         let _ = Self::validate_and_apply_transactions(&block.transactions, &mut self.utxos);
     }
 
-    // Recompute UTXO set from scratch (used on startup).
     fn rebuild_utxos(&mut self) {
         self.utxos.clear();
-        for block in &self.blocks {
-            let _ = Self::validate_and_apply_transactions(&block.transactions, &mut self.utxos);
+        for b in &self.blocks {
+            let _ = Self::validate_and_apply_transactions(&b.transactions, &mut self.utxos);
         }
     }
 
-    // Full chain validation (hashes + PoW + UTXO).
+    fn chain_work(&self) -> u128 {
+        // simple cumulative work approx: sum 2^difficulty
+        self.blocks
+            .iter()
+            .map(|b| 1u128 << (b.difficulty.min(120)))
+            .sum()
+    }
+
     fn is_chain_valid(&self) -> bool {
         if self.blocks.is_empty() {
             return false;
         }
+        let mut temp_utxos = HashMap::new();
 
-        let mut utxos = HashMap::new();
         for i in 0..self.blocks.len() {
-            let block = &self.blocks[i];
-            if block.hash != block.calculate_hash() {
+            let b = &self.blocks[i];
+            if b.hash != b.calculate_hash() {
                 return false;
             }
-            if i != 0 && !block.hash.starts_with(&"0".repeat(self.difficulty)) {
+            if !has_leading_zero_bits_hex(&b.hash, b.difficulty) {
+                return false;
+            }
+            if merkle_root_hex(&b.transactions) != b.merkle_root {
                 return false;
             }
             if i == 0 {
-                if block.previous_hash != "0" {
+                if b.previous_hash != "0" {
                     return false;
                 }
-            } else if block.previous_hash != self.blocks[i - 1].hash {
+            } else if b.previous_hash != self.blocks[i - 1].hash {
                 return false;
             }
-
-            if !Self::validate_and_apply_transactions(&block.transactions, &mut utxos) {
+            if !Self::validate_and_apply_transactions(&b.transactions, &mut temp_utxos) {
                 return false;
             }
         }
         true
     }
 
-    // Serialize the full chain for syncing.
     fn serialize_chain(&self) -> String {
-        self.blocks
-            .iter()
-            .map(|b| b.serialize())
-            .collect::<Vec<_>>()
-            .join("##")
+        serde_json::to_string(&self.blocks).unwrap_or_default()
     }
 
-    // Deserialize a chain and validate it.
-    fn deserialize_chain(s: &str, difficulty: usize, miner_address: &str) -> Option<Self> {
-        let s = s.trim();
-        if s.is_empty() {
-            return None;
-        }
-        let blocks: Vec<Block> = s.split("##").filter_map(Block::deserialize).collect();
+    fn deserialize_chain(payload: &str, difficulty: u32, miner_pubkey_hash: &str) -> Option<Self> {
+        let blocks: Vec<Block> = serde_json::from_str(payload).ok()?;
         if blocks.is_empty() {
             return None;
         }
-        let mut chain = Blockchain {
+        let mut chain = Self {
             blocks,
             difficulty,
             utxos: HashMap::new(),
-            miner_address: miner_address.to_string(),
+            miner_pubkey_hash: miner_pubkey_hash.to_string(),
         };
         if !chain.is_chain_valid() {
             return None;
@@ -502,54 +469,105 @@ impl Blockchain {
         Some(chain)
     }
 
-    // FIX: Remove transactions from mempool that are in a block
     fn remove_txs_from_mempool(&self, mempool: &mut Vec<Transaction>, block: &Block) {
-        let block_txids: HashSet<String> = block.transactions.iter().map(|tx| tx.txid()).collect();
-        mempool.retain(|tx| !block_txids.contains(&tx.txid()));
+        let set: HashSet<String> = block.transactions.iter().map(|t| t.txid()).collect();
+        mempool.retain(|t| !set.contains(&t.txid()));
     }
 }
 
-// --------- Helpers ---------
+fn load_chain_from_disk(
+    path: &str,
+    difficulty: u32,
+    miner_pubkey_hash: &str,
+) -> Option<Blockchain> {
+    let data = fs::read_to_string(path).ok()?;
+    Blockchain::deserialize_chain(&data, difficulty, miner_pubkey_hash)
+}
+
+fn save_chain_to_disk(path: &str, chain: &Blockchain) -> bool {
+    if let Some(parent) = Path::new(path).parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return false;
+        }
+    }
+    fs::write(path, chain.serialize_chain()).is_ok()
+}
 
 fn now_ts() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
+        .expect("time error")
         .as_secs()
 }
 
 fn hash_str(input: &str) -> String {
-    let hash_bytes = Sha256::digest(input.as_bytes());
-    format!("{:x}", hash_bytes)
+    let h = Sha256::digest(input.as_bytes());
+    hex::encode(h)
 }
 
-// Addresses must not contain our serialization separators.
-fn is_address_safe(addr: &str) -> bool {
-    !addr
-        .chars()
-        .any(|c| c == ':' || c == ',' || c == '|' || c == '~' || c == ';')
+fn hash160_hex(data: &[u8]) -> String {
+    let sha = Sha256::digest(data);
+    let ripe = Ripemd160::digest(sha);
+    hex::encode(ripe)
 }
 
-// Build a simple transaction by selecting UTXOs for "from".
+fn has_leading_zero_bits_hex(hash_hex: &str, zero_bits: u32) -> bool {
+    let bytes = match hex::decode(hash_hex) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let mut rem = zero_bits;
+    for b in bytes {
+        if rem == 0 {
+            return true;
+        }
+        if rem >= 8 {
+            if b != 0 {
+                return false;
+            }
+            rem -= 8;
+        } else {
+            let mask = 0xFFu8 << (8 - rem);
+            return (b & mask) == 0;
+        }
+    }
+    rem == 0
+}
+
+fn merkle_root_hex(txs: &[Transaction]) -> String {
+    if txs.is_empty() {
+        return hash_str("");
+    }
+    let mut layer: Vec<String> = txs.iter().map(|t| t.txid()).collect();
+    while layer.len() > 1 {
+        if layer.len() % 2 == 1 {
+            let last = layer.last().cloned().unwrap();
+            layer.push(last);
+        }
+        let mut next = Vec::with_capacity(layer.len() / 2);
+        let mut i = 0usize;
+        while i < layer.len() {
+            next.push(hash_str(&(layer[i].clone() + &layer[i + 1])));
+            i += 2;
+        }
+        layer = next;
+    }
+    layer[0].clone()
+}
+
 fn build_transaction(
-    from: &str,
-    to: &str,
+    wallet: &Wallet,
+    to_pubkey_hash: &str,
     amount: u64,
     utxos: &HashMap<(String, usize), TxOut>,
 ) -> Option<Transaction> {
-    if !is_address_safe(from) || !is_address_safe(to) {
-        return None;
-    }
-    let mut selected = Vec::new();
+    let mut selected: Vec<((String, usize), TxOut)> = Vec::new();
     let mut total = 0u64;
 
-    for ((txid, vout), out) in utxos.iter() {
-        if out.address == from {
-            selected.push(TxIn {
-                txid: txid.clone(),
-                vout: *vout,
-            });
-            total += out.amount;
+    for (k, out) in utxos.iter() {
+        if out.pubkey_hash == wallet.pubkey_hash_hex {
+            selected.push((k.clone(), out.clone()));
+            total = total.checked_add(out.amount)?;
             if total >= amount {
                 break;
             }
@@ -560,29 +578,46 @@ fn build_transaction(
         return None;
     }
 
+    let mut inputs = Vec::new();
+    for ((txid, vout), _) in &selected {
+        inputs.push(TxIn {
+            txid: txid.clone(),
+            vout: *vout,
+            signature: String::new(),
+            pubkey: String::new(),
+        });
+    }
+
     let mut outputs = vec![TxOut {
-        address: to.to_string(),
+        pubkey_hash: to_pubkey_hash.to_string(),
         amount,
     }];
 
     let change = total - amount;
     if change > 0 {
         outputs.push(TxOut {
-            address: from.to_string(),
+            pubkey_hash: wallet.pubkey_hash_hex.clone(),
             amount: change,
         });
     }
 
-    Some(Transaction::new(selected, outputs))
+    let mut tx = Transaction::new(inputs, outputs);
+
+    for (i, ((txid, vout), _)) in selected.iter().enumerate() {
+        let prev = utxos.get(&(txid.clone(), *vout))?;
+        if !tx.sign_input(i, wallet, &prev.pubkey_hash) {
+            return None;
+        }
+    }
+
+    Some(tx)
 }
 
-// ------------- Networking -------------
-
 fn send_message(peer: &str, msg: &str) {
-    if let Ok(mut stream) = TcpStream::connect(peer) {
-        let _ = stream.write_all(msg.as_bytes());
-        let _ = stream.write_all(b"\n");
-        let _ = stream.flush();
+    if let Ok(mut s) = TcpStream::connect(peer) {
+        let _ = s.write_all(msg.as_bytes());
+        let _ = s.write_all(b"\n");
+        let _ = s.flush();
     }
 }
 
@@ -590,12 +625,8 @@ fn read_message(stream: TcpStream) -> Option<String> {
     let mut reader = BufReader::new(stream);
     let mut buf = String::new();
     reader.read_line(&mut buf).ok()?;
-    let trimmed = buf.trim().to_string();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
-    }
+    let t = buf.trim().to_string();
+    if t.is_empty() { None } else { Some(t) }
 }
 
 fn request_chain(peer: &str) -> Option<String> {
@@ -608,11 +639,7 @@ fn request_chain(peer: &str) -> Option<String> {
     let mut buf = String::new();
     reader.read_line(&mut buf).ok()?;
     let msg = buf.trim().to_string();
-    if let Some(rest) = msg.strip_prefix("CHAIN|") {
-        Some(rest.to_string())
-    } else {
-        None
-    }
+    msg.strip_prefix("CHAIN|").map(|s| s.to_string())
 }
 
 fn broadcast(peers: &[String], msg: &str) {
@@ -621,33 +648,28 @@ fn broadcast(peers: &[String], msg: &str) {
     }
 }
 
-// Pull a longer chain from peers (very simple consensus).
 fn sync_from_peers(
     chain: &Arc<Mutex<Blockchain>>,
     peers: &[String],
-    difficulty: usize,
-    miner_address: &str,
+    difficulty: u32,
+    miner_pubkey_hash: &str,
+    chain_path: &str,
 ) {
     for peer in peers {
         if let Some(payload) = request_chain(peer) {
-            if let Some(new_chain) =
-                Blockchain::deserialize_chain(&payload, difficulty, miner_address)
+            if let Some(remote) =
+                Blockchain::deserialize_chain(&payload, difficulty, miner_pubkey_hash)
             {
                 let mut local = chain.lock().unwrap();
-                let local_len = local.blocks.len();
-                let new_len = new_chain.blocks.len();
-
-                // FIX: Only replace if strictly longer (prevent fork confusion)
-                if new_len > local_len {
-                    println!("synced to longer chain (height {})", new_len);
-                    *local = new_chain;
+                if remote.is_chain_valid() && remote.chain_work() > local.chain_work() {
+                    *local = remote;
+                    let _ = save_chain_to_disk(chain_path, &local);
+                    println!("synced to better chain");
                 }
             }
         }
     }
 }
-
-// ------------- Main -------------
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -655,7 +677,8 @@ fn main() {
         .next()
         .expect("usage: blockchain_prototype <port> [peer1 peer2 ...] [--miner]");
     let mut is_miner = false;
-    let mut peers: Vec<String> = Vec::new();
+    let mut peers = Vec::<String>::new();
+
     for arg in args {
         if arg == "--miner" {
             is_miner = true;
@@ -664,46 +687,79 @@ fn main() {
         }
     }
 
-    let difficulty = 2;
-    let my_addr = format!("miner-{}", port);
+    let difficulty: u32 = 16;
+    let wallet = Wallet::new();
 
-    // Shared chain state for listener thread + CLI thread.
-    let chain = Arc::new(Mutex::new(Blockchain::new(difficulty, &my_addr)));
-    // Shared mempool (pending transactions).
+    println!("node pubkey_hash (address): {}", wallet.pubkey_hash_hex);
+
+    let chain_data = load_chain_from_disk(CHAIN_PATH, difficulty, &wallet.pubkey_hash_hex)
+        .unwrap_or_else(|| Blockchain::new(difficulty, &wallet.pubkey_hash_hex));
+    let chain = Arc::new(Mutex::new(chain_data));
+    {
+        let c = chain.lock().unwrap();
+        let _ = save_chain_to_disk(CHAIN_PATH, &c);
+    }
     let mempool = Arc::new(Mutex::new(Vec::<Transaction>::new()));
-    // Flag to avoid starting multiple miners at once.
     let mining_flag = Arc::new(Mutex::new(false));
 
-    // Listener thread handles incoming network messages.
     let listener_chain = Arc::clone(&chain);
     let listener_mempool = Arc::clone(&mempool);
     let listener_peers = peers.clone();
-    let listener_addr = my_addr.clone();
+    let miner_pkh = wallet.pubkey_hash_hex.clone();
+    let port_for_listener = port.clone();
+
     thread::spawn(move || {
-        let listener =
-            TcpListener::bind(format!("127.0.0.1:{}", port)).expect("failed to bind listener");
+        let listener = TcpListener::bind(format!("127.0.0.1:{}", port_for_listener))
+            .expect("failed to bind listener");
         for incoming in listener.incoming() {
             if let Ok(mut stream) = incoming {
                 let chain_arc = Arc::clone(&listener_chain);
                 let mempool_arc = Arc::clone(&listener_mempool);
                 let peers = listener_peers.clone();
-                let miner_address = listener_addr.clone();
+                let miner_pkh = miner_pkh.clone();
+
                 thread::spawn(move || {
                     if let Some(msg) = read_message(stream.try_clone().unwrap()) {
                         if msg == "REQ_CHAIN" {
-                            let chain = chain_arc.lock().unwrap();
-                            let payload = chain.serialize_chain();
+                            let c = chain_arc.lock().unwrap();
+                            let payload = c.serialize_chain();
                             let _ = stream.write_all(format!("CHAIN|{}\n", payload).as_bytes());
+                            let _ = stream.flush();
+                            return;
+                        }
+
+                        if msg == "REQ_STATE" {
+                            let c = chain_arc.lock().unwrap();
+                            let pool = mempool_arc.lock().unwrap();
+                            let state = NodeState {
+                                chain: c.serialize_chain(),
+                                height: c.blocks.len(),
+                                tip: c.blocks.last().map(|b| b.hash.clone()).unwrap_or_default(),
+                                mempool: pool.clone(),
+                                utxo_count: c.utxos.len(),
+                                difficulty: c.difficulty,
+                            };
+                            let payload = serde_json::to_string(&state).unwrap_or_default();
+                            let _ = stream.write_all(format!("STATE|{}\n", payload).as_bytes());
                             let _ = stream.flush();
                             return;
                         }
 
                         if let Some(rest) = msg.strip_prefix("TX|") {
                             if let Some(tx) = Transaction::deserialize(rest) {
-                                println!("received tx");
-                                let mut pool = mempool_arc.lock().unwrap();
-                                if !pool.iter().any(|t| t.txid() == tx.txid()) {
-                                    pool.push(tx);
+                                let c = chain_arc.lock().unwrap();
+                                let mut temp = c.utxos.clone();
+                                let valid = Blockchain::validate_and_apply_transactions(
+                                    &[Transaction::coinbase("dummy", 0), tx.clone()],
+                                    &mut temp,
+                                );
+                                drop(c);
+
+                                if valid {
+                                    let mut pool = mempool_arc.lock().unwrap();
+                                    if !pool.iter().any(|t| t.txid() == tx.txid()) {
+                                        pool.push(tx);
+                                    }
                                 }
                             }
                             return;
@@ -711,49 +767,20 @@ fn main() {
 
                         if let Some(rest) = msg.strip_prefix("BLOCK|") {
                             if let Some(block) = Block::deserialize(rest) {
-                                println!(
-                                    "received block (index={}, prev={}...)",
-                                    block.index,
-                                    &block.previous_hash[..8]
-                                );
-
-                                let mut chain = chain_arc.lock().unwrap();
-                                let current_height = chain.blocks.len();
-                                let current_tip = chain
-                                    .blocks
-                                    .last()
-                                    .map(|b| b.hash.clone())
-                                    .unwrap_or_default();
-
-                                let ok = chain.add_block(block.clone());
-
-                                // FIX: Clean mempool when we accept a block
+                                let mut c = chain_arc.lock().unwrap();
+                                let ok = c.add_block(block.clone());
                                 if ok {
                                     let mut pool = mempool_arc.lock().unwrap();
-                                    chain.remove_txs_from_mempool(&mut pool, &block);
-                                }
-
-                                drop(chain);
-
-                                if ok {
-                                    println!("  -> accepted (extended chain)");
+                                    c.remove_txs_from_mempool(&mut pool, &block);
+                                    let _ = save_chain_to_disk(CHAIN_PATH, &c);
+                                    drop(pool);
+                                    drop(c);
                                     broadcast(&peers, &format!("BLOCK|{}", block.serialize()));
                                 } else {
-                                    println!(
-                                        "  -> rejected (current height={}, tip={}...)",
-                                        current_height,
-                                        &current_tip[..8]
+                                    drop(c);
+                                    sync_from_peers(
+                                        &chain_arc, &peers, difficulty, &miner_pkh, CHAIN_PATH,
                                     );
-                                    // Only sync if we might be behind
-                                    if block.index as usize >= current_height {
-                                        println!("  -> syncing from peers");
-                                        sync_from_peers(
-                                            &chain_arc,
-                                            &peers,
-                                            difficulty,
-                                            &miner_address,
-                                        );
-                                    }
                                 }
                             }
                             return;
@@ -764,18 +791,27 @@ fn main() {
         }
     });
 
-    // Initial sync at startup.
-    sync_from_peers(&chain, &peers, difficulty, &my_addr);
+    sync_from_peers(
+        &chain,
+        &peers,
+        difficulty,
+        &wallet.pubkey_hash_hex,
+        CHAIN_PATH,
+    );
 
-    // CLI commands.
-    println!("Node {} running.", my_addr);
-    println!("Commands: send <to> <amount> | mine | balance | chain | tamper");
-    println!("Note: mining requires --miner");
+    println!("Node running on {}", port);
+    println!("Commands:");
+    println!("  address");
+    println!("  send <to_pubkey_hash_hex> <amount>");
+    println!("  mine");
+    println!("  balance");
+    println!("  chain");
 
     let stdin = io::stdin();
     loop {
         print!("> ");
         let _ = io::stdout().flush();
+
         let mut line = String::new();
         if stdin.read_line(&mut line).is_err() {
             continue;
@@ -786,83 +822,96 @@ fn main() {
         }
         let parts: Vec<&str> = line.split_whitespace().collect();
 
-        if parts[0] == "send" && parts.len() == 3 {
-            let to = parts[1];
-            let amount: u64 = match parts[2].parse() {
-                Ok(a) => a,
-                Err(_) => {
-                    println!("invalid amount");
+        match parts[0] {
+            "address" => {
+                println!("{}", wallet.pubkey_hash_hex);
+            }
+            "send" => {
+                if parts.len() != 3 {
+                    println!("usage: send <to_pubkey_hash_hex> <amount>");
                     continue;
                 }
-            };
+                let to = parts[1];
+                let amount: u64 = match parts[2].parse() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        println!("invalid amount");
+                        continue;
+                    }
+                };
 
-            let utxos = chain.lock().unwrap().utxos.clone();
-            if let Some(tx) = build_transaction(&my_addr, to, amount, &utxos) {
-                let mut pool = mempool.lock().unwrap();
-                if !pool.iter().any(|t| t.txid() == tx.txid()) {
-                    pool.push(tx.clone());
+                let utxos = chain.lock().unwrap().utxos.clone();
+                if let Some(tx) = build_transaction(&wallet, to, amount, &utxos) {
+                    let mut pool = mempool.lock().unwrap();
+                    if !pool.iter().any(|t| t.txid() == tx.txid()) {
+                        pool.push(tx.clone());
+                    }
+                    drop(pool);
+                    broadcast(&peers, &format!("TX|{}", tx.serialize()));
+                    println!("tx broadcast");
+                } else {
+                    println!("cannot build tx (funds/signing)");
                 }
-                drop(pool);
-                broadcast(&peers, &format!("TX|{}", tx.serialize()));
-                println!("tx broadcast");
-            } else {
-                println!("insufficient funds or invalid address");
             }
-        } else if parts[0] == "mine" {
-            if !is_miner {
-                println!("mining disabled (start with --miner)");
-            } else {
+            "mine" => {
+                if !is_miner {
+                    println!("mining disabled (use --miner)");
+                    continue;
+                }
                 let flag = Arc::clone(&mining_flag);
                 if *flag.lock().unwrap() {
-                    println!("mining in progress");
-                } else {
-                    *flag.lock().unwrap() = true;
-                    let chain = Arc::clone(&chain);
-                    let peers = peers.clone();
-                    let mempool = Arc::clone(&mempool);
-                    thread::spawn(move || {
-                        let txs = {
-                            let mut pool = mempool.lock().unwrap();
-                            let txs = pool.drain(..).collect::<Vec<_>>();
-                            txs
-                        };
-                        let mut chain = chain.lock().unwrap();
-                        let block = chain.mine_block_with_txs(txs);
-                        drop(chain);
-                        if let Some(block) = block {
-                            broadcast(&peers, &format!("BLOCK|{}", block.serialize()));
-                            println!("block mined and broadcast");
-                        } else {
-                            println!("block rejected");
-                        }
-                        *flag.lock().unwrap() = false;
-                    });
+                    println!("mining already in progress");
+                    continue;
                 }
+
+                *flag.lock().unwrap() = true;
+                let chain = Arc::clone(&chain);
+                let mempool = Arc::clone(&mempool);
+                let peers = peers.clone();
+                thread::spawn(move || {
+                    let txs = {
+                        let mut pool = mempool.lock().unwrap();
+                        pool.drain(..).collect::<Vec<_>>()
+                    };
+
+                    let mut c = chain.lock().unwrap();
+                    let block = c.mine_block_with_txs(txs);
+                    drop(c);
+
+                    if let Some(block) = block {
+                        let c = chain.lock().unwrap();
+                        let _ = save_chain_to_disk(CHAIN_PATH, &c);
+                        drop(c);
+                        broadcast(&peers, &format!("BLOCK|{}", block.serialize()));
+                        println!("mined and broadcast block");
+                    } else {
+                        println!("mined block rejected");
+                    }
+
+                    *flag.lock().unwrap() = false;
+                });
             }
-        } else if parts[0] == "balance" {
-            let chain = chain.lock().unwrap();
-            let mut total = 0u64;
-            for out in chain.utxos.values() {
-                if out.address == my_addr {
-                    total += out.amount;
+            "balance" => {
+                let c = chain.lock().unwrap();
+                let mut total = 0u64;
+                for out in c.utxos.values() {
+                    if out.pubkey_hash == wallet.pubkey_hash_hex {
+                        total = total.saturating_add(out.amount);
+                    }
                 }
+                println!("{}", total);
             }
-            println!("balance: {}", total);
-        } else if parts[0] == "chain" {
-            let chain = chain.lock().unwrap();
-            println!("height: {}", chain.blocks.len());
-            println!("valid: {}", chain.is_chain_valid());
-            println!("tip: {}", chain.blocks.last().unwrap().hash);
-        } else if parts[0] == "tamper" {
-            let mut chain = chain.lock().unwrap();
-            if chain.blocks.len() > 1 {
-                chain.blocks[1].transactions[0].outputs[0].amount += 1;
-                println!("tampered block 1");
-            } else {
-                println!("no block to tamper");
+            "chain" => {
+                let c = chain.lock().unwrap();
+                println!("height: {}", c.blocks.len());
+                println!("valid: {}", c.is_chain_valid());
+                println!("work: {}", c.chain_work());
+                println!(
+                    "tip: {}",
+                    c.blocks.last().map(|b| b.hash.clone()).unwrap_or_default()
+                );
             }
-        } else {
-            println!("unknown command");
+            _ => println!("unknown command"),
         }
     }
 }
